@@ -1168,6 +1168,106 @@ class TemuProductParser:
 
 # ========================= 主流程 =========================
 
+def _detect_has_non_chinese(text):
+    if not text:
+        return False
+    non_cn = 0
+    for ch in text:
+        if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf':
+            continue
+        if ch.isspace() or ch.isdigit() or ch in '.,;:!?()-/–—・·':
+            continue
+        non_cn += 1
+    return non_cn > len(text) * 0.3
+
+
+def translate_to_chinese(text, cache=None, source='auto'):
+    if not text or not _detect_has_non_chinese(text):
+        return text
+    if cache is None:
+        cache = {}
+    text = text.strip()
+    if text in cache:
+        return cache[text]
+    proxy = None
+    for var in ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']:
+        val = os.environ.get(var, '')
+        if val:
+            proxy = {"http": val, "https": val}
+            break
+    try:
+        from deep_translator import GoogleTranslator
+        translator = GoogleTranslator(source=source, target='zh-CN', proxies=proxy)
+        result = translator.translate(text)
+        if result and result != text:
+            cache[text] = result
+            logger.info(f"翻译: {text[:50]}... → {result[:50]}...")
+            return result
+    except Exception as e:
+        logger.warning(f"翻译失败 ({text[:30]}...): {e}")
+    return text
+
+
+def translate_result(result):
+    """返回一个全新翻译后的结果副本，原文替换为中文"""
+    cache = {}
+    proxy = None
+    for var in ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']:
+        val = os.environ.get(var, '')
+        if val:
+            proxy = {"http": val, "https": val}
+            break
+    logger.info("开始翻译外文字段为中文...")
+
+    cn = {}
+    _skip_keys = {"source_url", "goodsId", "_api_error", "mallId", "platform_code"}
+    _image_keys = {"images", "thumbUrl", "skuGallery"}
+    _copy_keys = {"price", "currency"}
+
+    for k, v in result.items():
+        if k in _skip_keys:
+            cn[k] = v
+        elif k in _image_keys:
+            cn[k] = v
+        elif k in _copy_keys:
+            cn[k] = v
+        elif k == "title":
+            cn[k] = translate_to_chinese(v, cache) if _detect_has_non_chinese(v) else v
+            time.sleep(0.3)
+        elif k == "brand":
+            cn[k] = translate_to_chinese(v, cache) if _detect_has_non_chinese(v) else v
+            time.sleep(0.3)
+        elif k == "categories":
+            cn[k] = [translate_to_chinese(c, cache) if _detect_has_non_chinese(c) else c
+                     for c in (v or [])]
+        elif k == "aboutThisItem":
+            cn[k] = [translate_to_chinese(i, cache, source='auto') if _detect_has_non_chinese(i) else i
+                     for i in (v or [])]
+        elif k == "productDetails":
+            cn[k] = {(
+                translate_to_chinese(dk, cache) if _detect_has_non_chinese(dk) else dk
+            ): (
+                translate_to_chinese(str(dv), cache) if _detect_has_non_chinese(str(dv)) else str(dv)
+            ) for dk, dv in (v or {}).items()}
+        elif k == "productDescription":
+            cn[k] = translate_to_chinese(v, cache, source='auto') if _detect_has_non_chinese(v) else v
+        elif k == "skus":
+            cn[k] = []
+            for sku in (v or []):
+                sku_cn = {}
+                for sk, sv in sku.items():
+                    if sk == "goodsName" and _detect_has_non_chinese(sv):
+                        sku_cn[sk] = translate_to_chinese(sv, cache, source='auto')
+                    else:
+                        sku_cn[sk] = sv
+                cn[k].append(sku_cn)
+        else:
+            cn[k] = v
+
+    logger.info("翻译完成")
+    return cn
+
+
 def scrape_temu_product(url, output_dir="."):
     goods_id = extract_goods_id(url)
     logger.info(f"目标商品ID: {goods_id}")
@@ -1179,12 +1279,22 @@ def scrape_temu_product(url, output_dir="."):
     parser = TemuProductParser(html, url)
     result = parser.parse()
 
-    output_path = os.path.join(output_dir, f"{goods_id}.json")
     os.makedirs(output_dir, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
+
+    # 保存原始数据
+    raw_path = os.path.join(output_dir, f"{goods_id}.json")
+    with open(raw_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
-    logger.info(f"结果已保存到: {output_path}")
-    return result
+    logger.info(f"原始数据已保存到: {raw_path}")
+
+    # 翻译并保存中文版
+    cn_result = translate_result(result)
+    cn_path = os.path.join(output_dir, f"{goods_id}_cn.json")
+    with open(cn_path, "w", encoding="utf-8") as f:
+        json.dump(cn_result, f, ensure_ascii=False, indent=2)
+    logger.info(f"中文翻译已保存到: {cn_path}")
+
+    return cn_result
 
 
 def main():
@@ -1206,7 +1316,7 @@ def main():
 
     try:
         result = scrape_temu_product(url, output_dir)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(json.dumps(result, ensure_ascii=False, indent=2).encode(sys.stdout.encoding or 'utf-8', errors='replace').decode(sys.stdout.encoding or 'utf-8', errors='replace'))
     except Exception as e:
         logger.error(f"爬取失败: {e}")
         sys.exit(1)

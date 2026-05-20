@@ -104,6 +104,134 @@ def human_delay(min_ms=200, max_ms=800):
     time.sleep(random.uniform(min_ms, max_ms) / 1000.0)
 
 
+# ========================= 翻译功能 =========================
+
+def _detect_has_non_chinese(text):
+    """检测文本是否包含非中文内容（英文、日文等）"""
+    if not text:
+        return False
+    non_cn = 0
+    for ch in text:
+        if '\u4e00' <= ch <= '\u9fff' or '\u3400' <= ch <= '\u4dbf':
+            continue
+        if ch.isspace() or ch.isdigit() or ch in '.,;:!?()-/–—・·':
+            continue
+        non_cn += 1
+    return non_cn > len(text) * 0.3
+
+
+def _get_proxy_for_requests():
+    """获取 requests 库可用的代理配置"""
+    for var in ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']:
+        val = os.environ.get(var, '')
+        if val:
+            return {"http": val, "https": val}
+    return None
+
+
+def translate_to_chinese(text, cache=None, source='auto', proxy=None):
+    """将文本翻译为中文，使用 Google Translate (free)"""
+    if not text or not _detect_has_non_chinese(text):
+        return text
+
+    if cache is None:
+        cache = {}
+    text = text.strip()
+    if text in cache:
+        return cache[text]
+
+    # 确保翻译请求走代理
+    if proxy is None:
+        proxy = _get_proxy_for_requests()
+
+    try:
+        from deep_translator import GoogleTranslator
+        translator = GoogleTranslator(source=source, target='zh-CN', proxies=proxy)
+        result = translator.translate(text)
+        if result and result != text:
+            cache[text] = result
+            logger.info(f"翻译: {text[:50]}... → {result[:50]}...")
+            return result
+    except Exception as e:
+        logger.warning(f"翻译失败 ({text[:30]}...): {e}")
+        try:
+            time.sleep(2)
+            from deep_translator import GoogleTranslator
+            translator = GoogleTranslator(source=source, target='zh-CN', proxies=proxy)
+            result = translator.translate(text)
+            if result and result != text:
+                cache[text] = result
+                return result
+        except Exception:
+            pass
+
+    return text
+
+
+def translate_result(result):
+    """返回一个全新翻译后的结果副本，原文替换为中文"""
+    cache = {}
+    proxy = _get_proxy_for_requests()
+    logger.info("开始翻译外文字段为中文...")
+
+    cn = {}
+    _skip_keys = {"source_url", "goodsId", "_api_error", "mallId", "platform_code"}
+    _image_keys = {"images", "thumbUrl", "skuGallery"}
+    _copy_keys = {"price", "currency"}
+
+    for k, v in result.items():
+        if k in _skip_keys:
+            cn[k] = v
+        elif k in _image_keys:
+            cn[k] = v
+        elif k in _copy_keys:
+            cn[k] = v
+        elif k == "title":
+            cn[k] = translate_to_chinese(v, cache, proxy=proxy) if _detect_has_non_chinese(v) else v
+            time.sleep(0.3)
+        elif k == "brand":
+            cn[k] = translate_to_chinese(v, cache, proxy=proxy) if _detect_has_non_chinese(v) else v
+            time.sleep(0.3)
+        elif k == "categories":
+            cn[k] = [translate_to_chinese(c, cache, proxy=proxy) if _detect_has_non_chinese(c) else c
+                      for c in (v or [])]
+            for _ in (v or []):
+                if _detect_has_non_chinese(_):
+                    time.sleep(0.3)
+        elif k == "aboutThisItem":
+            cn[k] = [translate_to_chinese(i, cache, source='auto', proxy=proxy) if _detect_has_non_chinese(i) else i
+                      for i in (v or [])]
+            for _ in (v or []):
+                if _detect_has_non_chinese(_):
+                    time.sleep(0.3)
+        elif k == "productDetails":
+            cn[k] = {}
+            for dk, dv in (v or {}).items():
+                key_cn = translate_to_chinese(dk, cache, proxy=proxy) if _detect_has_non_chinese(dk) else dk
+                val_cn = translate_to_chinese(str(dv), cache, proxy=proxy) if _detect_has_non_chinese(str(dv)) else str(dv)
+                cn[k][key_cn] = val_cn
+                time.sleep(0.3)
+        elif k == "productDescription":
+            cn[k] = translate_to_chinese(v, cache, source='auto', proxy=proxy) if _detect_has_non_chinese(v) else v
+            time.sleep(0.3)
+        elif k == "skus":
+            cn[k] = []
+            for sku in (v or []):
+                sku_cn = {}
+                for sk, sv in sku.items():
+                    if sk == "goodsName" and _detect_has_non_chinese(sv):
+                        sku_cn[sk] = translate_to_chinese(sv, cache, source='auto', proxy=proxy)
+                        time.sleep(0.3)
+                    else:
+                        sku_cn[sk] = sv
+                cn[k].append(sku_cn)
+        else:
+            cn[k] = v
+
+    logger.info("翻译完成")
+    return cn
+
+
 # ========================= 浏览器启动 =========================
 
 def create_browser(visible=False, proxy=None):
@@ -139,8 +267,45 @@ def create_browser(visible=False, proxy=None):
 
 # ========================= 页面抓取 =========================
 
-def fetch_product_page(browser, url):
-    logger.info(f"打开商品页面: {url}")
+def _visit_homepage(context):
+    """先访问 Temu 首页，模拟真实用户入口"""
+    page = context.new_page()
+    logger.info("第1步: 访问 Temu 首页...")
+
+    try:
+        page.goto("https://www.temu.com/", wait_until="networkidle", timeout=60000)
+        logger.info("首页加载完成")
+    except Exception as e:
+        logger.warning(f"首页加载异常(可忽略): {e}")
+
+    # 首页浏览: 缓慢滚动几次
+    logger.info("模拟首页浏览行为...")
+    try:
+        for i in range(random.randint(2, 3)):
+            scroll_y = random.randint(300, 1200)
+            page.evaluate(f"window.scrollTo({{top: {scroll_y}, behavior: 'smooth'}})")
+            time.sleep(random.uniform(1.5, 3.5))
+    except Exception:
+        pass
+
+    # 停留一段时间，模拟阅读
+    stay = random.uniform(3, 6)
+    logger.info(f"首页停留 {stay:.1f}s...")
+    time.sleep(stay)
+
+    # 回到顶部
+    try:
+        page.evaluate("window.scrollTo({top: 0, behavior: 'smooth'})")
+        time.sleep(random.uniform(0.5, 1.5))
+    except Exception:
+        pass
+
+    page.close()
+    logger.info("首页浏览完毕")
+
+
+def fetch_product_page(browser, url, visible=False):
+    """经过首页预热后，访问商品详情页"""
 
     context = browser.new_context(
         viewport={"width": 1920, "height": 1080},
@@ -153,26 +318,41 @@ def fetch_product_page(browser, url):
         timezone_id="America/New_York",
     )
 
+    # --- 阶段1: 逛首页 ---
+    _visit_homepage(context)
+
+    # 首页到商品页之间的过渡延迟 (模拟看推荐)
+    interval = random.uniform(5, 12)
+    logger.info(f"浏览推荐商品，等待 {interval:.1f}s 后进入商品页...")
+    time.sleep(interval)
+
+    # --- 阶段2: 打开商品页 ---
+    logger.info(f"第2步: 打开商品详情页")
+
     page = context.new_page()
 
     try:
-        resp = page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-        logger.info(f"初始状态: {resp.status if resp else 'N/A'}")
+        page.goto(url, wait_until="networkidle", timeout=90000)
+        logger.info("商品页加载完成")
     except Exception as e:
-        logger.warning(f"初始导航异常: {e}")
+        logger.warning(f"商品页加载异常: {e}")
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
 
-    # 模拟真人浏览行为
-    _simulate_human_browsing(page)
+    # --- 阶段3: 模拟浏览商品详情 ---
+    _browse_product_page(page)
 
-    # 等待 API 请求完成并数据加载
-    success = _wait_for_product_data(page)
+    # --- 阶段4: 等待数据加载 ---
+    success = _wait_for_product_data(page, visible=visible)
     if success:
         logger.info("商品数据加载成功")
     else:
-        logger.warning("等待商品数据超时，将尝试解析已有数据")
+        logger.warning("等待商品数据超时，尝试解析已有数据")
 
-    # 额外等待一下确保所有异步请求完成
-    time.sleep(3)
+    # 额外缓冲
+    time.sleep(random.uniform(2, 4))
 
     html = page.content()
     logger.info(f"获取页面内容，长度: {len(html)}")
@@ -180,50 +360,48 @@ def fetch_product_page(browser, url):
     return html
 
 
-def _simulate_human_browsing(page):
-    """模拟真人浏览行为"""
-    try:
-        # 1. 随机滚动
-        for _ in range(random.randint(3, 5)):
-            scroll_y = random.randint(200, 1500)
-            page.evaluate(f"window.scrollTo({{top: {scroll_y}, behavior: 'smooth'}})")
-            human_delay(300, 1200)
-    except Exception:
-        pass
+def _browse_product_page(page):
+    """低频率模拟浏览商品详情页"""
+    logger.info("模拟商品页浏览...")
 
-    try:
-        # 2. 回到顶部
-        page.evaluate("window.scrollTo({top: 0, behavior: 'smooth'})")
-        human_delay(400, 1000)
-    except Exception:
-        pass
+    # 看标题区域 (短停)
+    time.sleep(random.uniform(1.5, 3))
 
+    # 缓慢滚动浏览图片区
     try:
-        # 3. 模拟鼠标悬停在图片区域
-        page.evaluate("""
-            const el = document.querySelector('img');
-            if (el) {
-                el.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
-            }
-        """)
-        human_delay(200, 600)
-    except Exception:
-        pass
-
-    try:
-        # 4. 缓慢滚动浏览
-        for y in range(0, 2000, random.randint(100, 300)):
+        for y in [400, 900, 1500, 2200]:
             page.evaluate(f"window.scrollTo({{top: {y}, behavior: 'smooth'}})")
-            human_delay(50, 150)
+            time.sleep(random.uniform(2, 5))
     except Exception:
         pass
 
+    # 在描述区域停留
+    time.sleep(random.uniform(2, 4))
 
-def _wait_for_product_data(page):
+    # 慢慢回到顶部
+    try:
+        page.evaluate("window.scrollTo({top: 0, behavior: 'smooth'})")
+        time.sleep(random.uniform(1, 2))
+    except Exception:
+        pass
+
+    logger.info("商品页浏览完毕")
+
+
+def _wait_for_product_data(page, visible=False):
     """等待商品数据通过 API 加载到 window.rawData 中"""
     logger.info("等待商品数据加载...")
     start = time.time()
-    max_wait = 60
+    max_wait = 90
+    captcha_timeout = 180  # 验证码等待最长 3 分钟
+
+    # 前15秒不做检查，让 API 自然完成
+    initial_wait = random.uniform(10, 18)
+    logger.info(f"静默等待 {initial_wait:.1f}s 让页面自然渲染...")
+    time.sleep(initial_wait)
+
+    captcha_detected = False
+    captcha_start = 0
 
     while time.time() - start < max_wait:
         try:
@@ -239,14 +417,12 @@ def _wait_for_product_data(page):
                         }
                         const error = store.error || store.webLayoutError;
                         if (error && error.errorCode) {
-                            return {status: 'error', errorCode: error.errorCode, msg: error.message || error.errorMsg};
+                            return {status: 'error', errorCode: error.errorCode, msg: error.message || error.errorMsg, token: error.verifyAuthToken || ''};
                         }
-                        // 检查是否有 h1/title 元素
                         const h1 = document.querySelector('h1');
                         if (h1 && h1.textContent.trim().length > 5) {
                             return {status: 'dom_ready', title: h1.textContent.trim().slice(0, 80)};
                         }
-                        // 检查是否有图片
                         const imgs = document.querySelectorAll('[class*="gallery"] img, [class*="product"] img');
                         if (imgs.length > 0) {
                             return {status: 'images_ready', count: imgs.length};
@@ -263,29 +439,43 @@ def _wait_for_product_data(page):
                 logger.info(f"商品数据已加载: {result.get('goodsKeys', [])}")
                 return True
             elif status == "error":
-                logger.warning(f"API 错误: code={result.get('errorCode')}, msg={result.get('msg')}")
-                return False
+                error_code = result.get("errorCode")
+                if error_code == 54001 and visible:
+                    if not captcha_detected:
+                        captcha_detected = True
+                        captcha_start = time.time()
+                        logger.warning("=" * 60)
+                        logger.warning("检测到人机验证 (54001)，请在浏览器窗口中手动完成验证")
+                        logger.warning(f"Token: {result.get('token', 'N/A')}")
+                        logger.warning("等待最长 3 分钟，验证通过后自动继续...")
+                        logger.warning("=" * 60)
+                    # 延长总等待时间，继续轮询
+                    if time.time() - captcha_start < captcha_timeout:
+                        elapsed = time.time() - captcha_start
+                        if elapsed > 10 and int(elapsed) % 30 == 0:
+                            logger.info(f"仍在等待验证... ({elapsed:.0f}s / {captcha_timeout}s)")
+                        time.sleep(random.uniform(3, 6))
+                        continue
+                    else:
+                        logger.warning("验证等待超时 (3分钟)")
+                        return False
+                else:
+                    logger.warning(f"API 错误: code={error_code}, msg={result.get('msg')}")
+                    if error_code != 54001 or not visible:
+                        return False
             elif status in ("dom_ready", "images_ready"):
                 logger.info(f"部分数据就绪: {status} - {result}")
                 return True
             else:
-                if time.time() - start > 10:
-                    logger.debug(f"状态: {status}, elapsed: {time.time()-start:.0f}s")
+                elapsed = time.time() - start
+                if elapsed > 20:
+                    logger.info(f"状态: {status} (已等 {elapsed:.0f}s)")
         except Exception as e:
-            logger.debug(f"JS 检查异常: {e}")
+            pass
 
-        time.sleep(2)
+        time.sleep(random.uniform(3, 6))
 
     logger.warning("等待超时")
-    return False
-
-
-def _has_product_data(html):
-    """检查 HTML 中是否包含商品数据"""
-    if "goodsId" in html and "goods_id" in html.lower():
-        return True
-    if '<h1' in html.lower():
-        return True
     return False
 
 
@@ -374,6 +564,9 @@ class CloakTemuParser:
         goods = store.get("goods", {})
 
         price_candidates = [
+            # Temu store.goods 中的价格字段 (新版)
+            "minOnSalePrice", "maxOnSalePrice", "minToMaxPriceStr",
+            "minOnSalePriceStr", "salePriceRich", "minToMaxSalePriceRich",
             "salePrice", "price", "minPrice", "sale_price",
             "discountPrice", "appPrice",
         ]
@@ -383,7 +576,13 @@ class CloakTemuParser:
                 continue
             if isinstance(val, dict):
                 amount = val.get("amount") or val.get("value") or val.get("cent")
-                currency_code = val.get("currencyCode") or val.get("currency", "USD")
+                currency_code = val.get("currencyCode") or val.get("currency", "")
+
+                # 日本站点: 尝试从 store 获取货币
+                if not currency_code:
+                    local_info = store.get("localInfo") or {}
+                    currency_code = local_info.get("currency", "JPY")
+
                 if amount is not None:
                     try:
                         price_float = float(amount) / 100
@@ -392,15 +591,39 @@ class CloakTemuParser:
                     currency_map = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "KRW": "₩", "CAD": "$"}
                     return f"{price_float:.2f}", currency_map.get(currency_code, "$")
             elif isinstance(val, (int, float)):
+                # 判断是否为分单位: 如果是日本站点或金额较大，按分处理
+                local_info = store.get("localInfo") or {}
+                currency = local_info.get("currency", "")
+                if val > 100 or currency in ("JPY", "KRW"):
+                    try:
+                        return f"{float(val) / 100:.2f}", {"JPY": "¥", "KRW": "₩"}.get(currency, "$")
+                    except (ValueError, TypeError):
+                        pass
                 try:
-                    return f"{float(val) / 100:.2f}", "$"
+                    return f"{float(val):.2f}", "$"
                 except (ValueError, TypeError):
                     return f"{safe_float(str(val)):.2f}", "$"
             elif isinstance(val, str):
+                # 字符串价格: 如 "¥299"
                 currency = extract_currency_symbol(val)
                 price_val = clean_price(val)
                 if price_val and price_val != "0.00":
                     return price_val, currency
+
+        # 尝试从 priceInfo 子结构获取
+        price_info = goods.get("priceInfo") or goods.get("price_info") or {}
+        if isinstance(price_info, dict):
+            for field in ["salePrice", "price", "minPrice", "minOnSalePrice"]:
+                val = price_info.get(field)
+                if isinstance(val, (int, float)) and val > 0:
+                    local_info = store.get("localInfo") or {}
+                    currency = {"JPY": "¥", "USD": "$", "EUR": "€", "GBP": "£"}.get(local_info.get("currency", ""), "$")
+                    try:
+                        return f"{float(val) / 100:.2f}", currency
+                    except (ValueError, TypeError):
+                        return f"{safe_float(str(val)):.2f}", currency
+                elif isinstance(val, str) and val:
+                    return clean_price(val), extract_currency_symbol(val) or "$"
 
         # DOM 提取
         for sel in [
@@ -702,23 +925,34 @@ class CloakTemuParser:
 
 # ========================= 主流程 =========================
 
-def scrape_temu_product(url, output_dir=".", visible=False, proxy=None):
+def scrape_temu_product(url, output_dir=".", visible=False, proxy=None, translate=True):
     goods_id = extract_goods_id(url)
     logger.info(f"目标商品ID: {goods_id}")
 
     browser = None
     try:
         browser = create_browser(visible=visible, proxy=proxy)
-        html = fetch_product_page(browser, url)
+        html = fetch_product_page(browser, url, visible=visible)
 
         parser = CloakTemuParser(html, url)
         result = parser.parse()
 
-        output_path = os.path.join(output_dir, f"{goods_id}.json")
         os.makedirs(output_dir, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
+
+        # 保存原始数据
+        raw_path = os.path.join(output_dir, f"{goods_id}.json")
+        with open(raw_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
-        logger.info(f"结果已保存到: {output_path}")
+        logger.info(f"原始数据已保存到: {raw_path}")
+
+        # 翻译并保存中文版
+        if translate:
+            cn_result = translate_result(result)
+            cn_path = os.path.join(output_dir, f"{goods_id}_cn.json")
+            with open(cn_path, "w", encoding="utf-8") as f:
+                json.dump(cn_result, f, ensure_ascii=False, indent=2)
+            logger.info(f"中文翻译已保存到: {cn_path}")
+            return cn_result
 
         return result
 
@@ -731,6 +965,16 @@ def scrape_temu_product(url, output_dir=".", visible=False, proxy=None):
                 pass
 
 
+def _detect_proxy():
+    """从环境变量自动检测代理地址 (兼容 Clash Verge)"""
+    for var in ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']:
+        val = os.environ.get(var, '')
+        if val:
+            logger.info(f"检测到代理: {val}")
+            return val
+    return None
+
+
 def main():
     import argparse
 
@@ -738,19 +982,27 @@ def main():
     parser.add_argument("url", help="Temu 商品页面 URL")
     parser.add_argument("output_dir", nargs="?", default=".", help="输出目录")
     parser.add_argument("--visible", action="store_true", help="显示浏览器窗口")
+    parser.add_argument("--no-proxy", action="store_true", help="禁用代理")
+    parser.add_argument("--no-translate", action="store_true", dest="no_translate", help="禁用外文翻译中文功能")
     args = parser.parse_args()
+
+    # 自动检测代理
+    proxy = None
+    if not args.no_proxy:
+        proxy = _detect_proxy()
 
     try:
         result = scrape_temu_product(
             args.url,
             output_dir=args.output_dir,
             visible=args.visible,
+            proxy=proxy,
+            translate=not args.no_translate,
         )
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(json.dumps(result, ensure_ascii=False, indent=2).encode(sys.stdout.encoding or 'utf-8', errors='replace').decode(sys.stdout.encoding or 'utf-8', errors='replace'))
 
-        # 数据质量检查
         if result.get("price") == "0.00" or not result.get("title"):
-            logger.warning("警告: 价格或标题为空，可能需要代理或 Cookie")
+            logger.warning("警告: 价格或标题为空，可能需要 Cookie")
 
     except Exception as e:
         logger.error(f"爬取失败: {e}")
