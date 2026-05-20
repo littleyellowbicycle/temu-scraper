@@ -356,12 +356,62 @@ class TemuProductParser:
     """Temu 商品页面解析器"""
 
     def __init__(self, html, source_url):
+        self.html = html
         self.soup = BeautifulSoup(html, "lxml")
         self.source_url = source_url
         self.goods_id = extract_goods_id(source_url)
+        self._store = None
         self._page_data = None
 
     # ---------- 页面内嵌数据提取 ----------
+
+    def _get_store(self):
+        """从 window.rawData 中提取 store 对象（带 goods keys 日志）"""
+        if self._store is not None:
+            return self._store
+        idx = self.html.find("window.rawData")
+        if idx >= 0:
+            start = self.html.find("{", idx)
+            if start >= 0:
+                depth = 0
+                for i in range(start, len(self.html)):
+                    if self.html[i] == "{":
+                        depth += 1
+                    elif self.html[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                raw = self.html[start:i + 1]
+                                raw = re.sub(r'\bundefined\b', 'null', raw)
+                                data = json.loads(raw)
+                                self._store = data.get("store", {})
+                                goods = self._store.get("goods", {})
+                                logger.info(f"提取 rawData.store: {len(self._store)} keys, goods: {len(goods)} keys")
+                                if goods:
+                                    logger.info(f"goods 字段: {list(goods.keys())[:30]}")
+                                return self._store
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"rawData 解析失败: {e}")
+                            break
+        for script in self.soup.select("script"):
+            text = script.string or ""
+            if not text:
+                continue
+            for prefix in ["__INITIAL_STATE__", "__NEXT_DATA__"]:
+                m = re.search(
+                    rf"window\.{prefix}\s*=\s*(\{{.*?\}})\s*;?\s*$",
+                    text, re.DOTALL | re.MULTILINE,
+                )
+                if m:
+                    try:
+                        raw = re.sub(r'\bundefined\b', 'null', m.group(1))
+                        self._store = json.loads(raw)
+                        logger.info(f"提取 {prefix}")
+                        return self._store
+                    except json.JSONDecodeError:
+                        continue
+        self._store = {}
+        return self._store
 
     def _extract_page_data(self):
         """
@@ -399,6 +449,10 @@ class TemuProductParser:
                                 raw = re.sub(r'\bundefined\b', 'null', raw)
                                 page_data["raw_data"] = json.loads(raw)
                                 logger.info("成功提取 window.rawData 数据")
+                                raw_store = page_data["raw_data"].get("store", {})
+                                raw_goods = raw_store.get("goods", {})
+                                if raw_goods:
+                                    logger.info(f"rawData goods 字段: {list(raw_goods.keys())[:30]}")
                             except json.JSONDecodeError as e:
                                 logger.warning(f"解析 window.rawData 失败: {e}")
                             break
@@ -505,94 +559,117 @@ class TemuProductParser:
     def parse_price(self):
         """
         解析价格，返回 (price_str, currency_symbol)
-        Temu 价格通常以分为单位存储
+        Temu 价格通常以分为单位存储（JPY/KRW 例外，不除以 100）
         """
-        pdata = self._get_product_data()
+        store = self._get_store()
+        goods = store.get("goods", {})
+
         price_candidates = [
+            "minOnSalePrice", "maxOnSalePrice", "minToMaxPriceStr",
+            "minOnSalePriceStr", "salePriceRich", "minToMaxSalePriceRich",
             "salePrice", "price", "minPrice", "sale_price",
             "discountPrice", "appPrice",
         ]
         for field in price_candidates:
-            val = pdata.get(field)
-            if val is not None:
-                if isinstance(val, dict):
-                    # {"amount": 2089, "currencyCode": "USD"}
-                    amount = val.get("amount") or val.get("value") or val.get("cent")
-                    currency_code = val.get("currencyCode") or val.get("currency", "USD")
-                    if amount is not None:
-                        try:
-                            price_float = float(amount) / 100
-                        except (ValueError, TypeError):
-                            price_float = safe_float(str(amount))
-                        currency_map = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "KRW": "₩"}
-                        return f"{price_float:.2f}", currency_map.get(currency_code, "$")
-                elif isinstance(val, (int, float)):
-                    try:
-                        price_float = float(val) / 100
-                    except (ValueError, TypeError):
-                        price_float = safe_float(str(val))
-                    return f"{price_float:.2f}", "$"
-                elif isinstance(val, str):
-                    currency = extract_currency_symbol(val)
-                    price_val = clean_price(val)
-                    if price_val and price_val != "0.00":
-                        return price_val, currency
+            val = goods.get(field)
+            if val is None:
+                continue
+            if isinstance(val, dict):
+                amount = val.get("amount") or val.get("value") or val.get("cent")
+                currency_code = val.get("currencyCode") or val.get("currency", "")
 
-        # HTML 选择器
-        price_selectors = [
-            '[class*="price"] [class*="sale"]',
-            '[class*="price"] [class*="discount"]',
-            '[class*="price"] [class*="current"]',
-            '[data-testid="product-price"]',
-            '[class*="Price"] [class*="Sale"]',
-            '.price_current',
-            '[class*="priceWrap"] span',
-        ]
-        for sel in price_selectors:
-            el = self.soup.select_one(sel)
-            if el:
-                price_text = safe_text(el)
-                currency = extract_currency_symbol(price_text)
-                price_val = clean_price(price_text)
+                if not currency_code:
+                    local_info = store.get("localInfo") or {}
+                    currency_code = local_info.get("currency", "USD")
+
+                if amount is not None:
+                    try:
+                        amount_f = float(amount)
+                        if currency_code in ("JPY", "KRW"):
+                            price_float = amount_f
+                        else:
+                            price_float = amount_f / 100
+                    except (ValueError, TypeError):
+                        price_float = safe_float(str(amount))
+                    currency_map = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "KRW": "₩", "CAD": "$"}
+                    return f"{price_float:.0f}" if currency_code in ("JPY", "KRW") else f"{price_float:.2f}", currency_map.get(currency_code, "$")
+            elif isinstance(val, (int, float)):
+                local_info = store.get("localInfo") or {}
+                currency_code = local_info.get("currency", "")
+                if currency_code in ("JPY", "KRW"):
+                    return f"{float(val):.0f}", {"JPY": "¥", "KRW": "₩"}.get(currency_code, "$")
+                try:
+                    return f"{float(val) / 100:.2f}", "$"
+                except (ValueError, TypeError):
+                    return f"{safe_float(str(val)):.2f}", "$"
+            elif isinstance(val, str):
+                currency = extract_currency_symbol(val)
+                price_val = clean_price(val)
                 if price_val and price_val != "0.00":
                     return price_val, currency
 
-        # meta 标签
-        meta = self.soup.select_one('meta[property="product:price:amount"]')
-        if meta:
-            price_val = meta.get("content", "")
-            meta_currency = self.soup.select_one('meta[property="product:price:currency"]')
-            currency_code = meta_currency.get("content", "USD") if meta_currency else "USD"
-            currency_map = {"USD": "$", "EUR": "€", "GBP": "£"}
-            return clean_price(price_val), currency_map.get(currency_code, "$")
+        # 尝试从 priceInfo 子结构获取
+        price_info = goods.get("priceInfo") or goods.get("price_info") or {}
+        if isinstance(price_info, dict):
+            for field in ["salePrice", "price", "minPrice", "minOnSalePrice"]:
+                val = price_info.get(field)
+                if isinstance(val, (int, float)) and val > 0:
+                    local_info = store.get("localInfo") or {}
+                    currency = {"JPY": "¥", "USD": "$", "EUR": "€", "GBP": "£"}.get(local_info.get("currency", ""), "$")
+                    try:
+                        return f"{float(val) / 100:.2f}", currency
+                    except (ValueError, TypeError):
+                        return f"{safe_float(str(val)):.2f}", currency
+                elif isinstance(val, str) and val:
+                    return clean_price(val), extract_currency_symbol(val) or "$"
 
-        # JSON-LD
-        ld = self._extract_page_data().get("ld_json", {})
-        if ld:
-            offers = ld.get("offers", {})
-            price = offers.get("price", "")
-            if price:
-                return clean_price(str(price)), "$"
+        # DOM 选择器
+        for sel in [
+            '[class*="price"] [class*="sale"]',
+            '[class*="price"] [class*="discount"]',
+            '[data-testid="product-price"]',
+            '.price_current',
+        ]:
+            el = self.soup.select_one(sel)
+            if el:
+                text = safe_text(el)
+                currency = extract_currency_symbol(text)
+                price_val = clean_price(text)
+                if price_val and price_val != "0.00":
+                    return price_val, currency
 
         return "0.00", "$"
 
     def parse_brand(self):
-        """解析品牌/店铺信息"""
-        pdata = self._get_product_data()
+        """解析品牌/店铺信息 — 优先 mall.mallData.mallName 和 saleInfo.mallName"""
+        store = self._get_store()
+        goods = store.get("goods", {})
+
+        mall_data = store.get("mall", {})
+        if isinstance(mall_data, dict):
+            mall_detail = mall_data.get("mallData", mall_data)
+            for key in ["mallName", "name"]:
+                v = mall_detail.get(key, "")
+                if v:
+                    return str(v)
+
+        sale_info = goods.get("saleInfo") or {}
+        for key in ["mallName", "providedBy"]:
+            v = sale_info.get(key, "")
+            if v:
+                return str(v)
+
         for key in ["brand", "brandName", "brand_name", "mallName", "shopName", "shop_name"]:
-            val = pdata.get(key, "")
+            val = goods.get(key, "")
             if val:
                 return str(val)
+
         brand_el = self.soup.select_one(
             '[class*="brand"], [class*="store"], [class*="shop"], [class*="mall"]')
         if brand_el:
             text = safe_text(brand_el)
             if text:
                 return text
-        ld = self._extract_page_data().get("ld_json", {})
-        brand = ld.get("brand", {})
-        if isinstance(brand, dict):
-            return brand.get("name", "")
         return ""
 
     def parse_categories(self):
@@ -654,27 +731,60 @@ class TemuProductParser:
         return images
 
     def parse_about_this_item(self):
-        """解析商品要点"""
+        """解析商品要点 — goodsProperty、saleInfo、extraProperty"""
+        store = self._get_store()
+        goods = store.get("goods", {})
+
         bullets = []
-        pdata = self._get_product_data()
-        desc_list = pdata.get("description") or pdata.get("highlights") or pdata.get("features") or []
-        if isinstance(desc_list, list):
-            for item in desc_list:
+
+        goods_prop = goods.get("goodsProperty") or []
+        if isinstance(goods_prop, list):
+            for prop in goods_prop:
+                if isinstance(prop, dict):
+                    key = prop.get("key", "")
+                    vals = prop.get("values") or []
+                    if isinstance(vals, list) and vals:
+                        bullets.append(f"{key}: {', '.join(str(v) for v in vals)}")
+
+        sale_info = goods.get("saleInfo") or {}
+        if isinstance(sale_info, dict):
+            for sk in ["goodsSoldTip", "sideSalesTip"]:
+                v = sale_info.get(sk, "")
+                if v and v.strip():
+                    bullets.append(str(v).strip().rstrip(","))
+
+        extra_prop = goods.get("extraProperty") or {}
+        if isinstance(extra_prop, dict):
+            prop_list = extra_prop.get("propertyList") or []
+            for item in prop_list:
                 if isinstance(item, dict):
-                    text = item.get("text") or item.get("content") or item.get("desc", "")
-                    if text:
-                        bullets.append(str(text))
-                elif isinstance(item, str) and item:
-                    bullets.append(item)
-        elif isinstance(desc_list, str) and desc_list:
-            bullets.append(desc_list)
+                    rich = item.get("richText") or {}
+                    texts = rich.get("textRich") or []
+                    for t in texts:
+                        if isinstance(t, dict) and t.get("type") == 0:
+                            v = t.get("value", "")
+                            if v and v not in bullets:
+                                bullets.append(str(v))
+
+        for src_name in ["description", "highlights", "features", "goodsDesc", "productDesc", "desc", "content"]:
+            val = goods.get(src_name) or store.get(src_name)
+            if val and isinstance(val, str) and val.strip() and val.strip() not in bullets:
+                bullets.append(val.strip())
+
+        rows = goods.get("rows") or store.get("rows") or []
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    desc = row.get("desc") or row.get("description") or row.get("text") or ""
+                    if desc and desc not in bullets:
+                        bullets.append(str(desc))
+
         if bullets:
             return bullets
-        # HTML
+
         for li in self.soup.select(
             '[class*="description"] li, [class*="feature"] li, '
-            '[class*="highlight"] li, [class*="detail"] li, '
-            '[class*="specification"] li, [class*="bullet"] li'
+            '[class*="detail"] li'
         ):
             text = safe_text(li)
             if text and len(text) > 5:
@@ -682,88 +792,88 @@ class TemuProductParser:
         return bullets
 
     def parse_product_description(self):
-        """解析商品描述"""
-        pdata = self._get_product_data()
-        for key in ["productDescription", "product_description", "desc", "description", "content"]:
-            val = pdata.get(key, "")
-            if val and isinstance(val, str):
+        """解析商品描述 — 检查 goods 字段，回退到 DOM"""
+        store = self._get_store()
+        goods = store.get("goods", {})
+        for key in ["productDescription", "desc", "description", "content", "goodsDesc"]:
+            val = goods.get(key, "")
+            if val and isinstance(val, str) and len(val) > 10:
                 return val
         desc_el = self.soup.select_one(
-            '[class*="productDesc"], [class*="product-desc"], '
-            '[class*="goodsDesc"], [class*="goods-desc"], '
-            '[class*="detailContent"]')
+            '[class*="productDesc"], [class*="goodsDesc"], [class*="detailContent"]')
         if desc_el:
             return safe_text(desc_el)
         return ""
 
     def parse_product_details(self):
-        """解析商品详细信息表"""
+        """解析商品详细信息 — goodsProperty、extraProperty、saleInfo、mall"""
+        store = self._get_store()
+        goods = store.get("goods", {})
+
         details = {}
-        pdata = self._get_product_data()
-        # 字段映射
-        detail_field_mapping = {
-            "brand": "Brand Name", "brandName": "Brand Name",
-            "material": "Material Type", "materialType": "Material Type",
-            "color": "Color", "size": "Size",
-            "weight": "Item Weight", "itemWeight": "Item Weight",
-            "capacity": "Capacity", "origin": "Country of Origin",
-            "countryOfOrigin": "Country of Origin",
-            "manufacturer": "Manufacturer",
-            "model": "Model Number", "modelNumber": "Model Number",
-            "pattern": "Pattern", "shape": "Shape",
-            "theme": "Theme", "style": "Product Style",
-            "productStyle": "Product Style",
-            "careInstructions": "Product Care Instructions",
-            "feature": "Material Features",
-            "materialFeature": "Material Features",
-            "reusable": "Reusability",
-            "bpaFree": "Material Type Free",
-            "finish": "Finish Types",
-            "specialFeature": "Other Special Features of the Product",
-            "upc": "UPC", "ean": "EAN",
-            "ageRange": "Age Range Description",
-            "numberOfItems": "Number of Items",
-            "unitCount": "Unit Count",
-        }
-        for src_key, dst_key in detail_field_mapping.items():
-            val = pdata.get(src_key)
-            if val is not None and str(val).strip():
-                details[dst_key] = str(val)
-        # 规格列表
-        specs_list = (
-            pdata.get("specs") or pdata.get("attributes") or
-            pdata.get("specifications") or pdata.get("attrList") or []
-        )
-        if isinstance(specs_list, list):
-            for item in specs_list:
+
+        goods_prop = goods.get("goodsProperty") or []
+        if isinstance(goods_prop, list):
+            for prop in goods_prop:
+                if isinstance(prop, dict):
+                    key = prop.get("key", "")
+                    vals = prop.get("values") or prop.get("value") or []
+                    if isinstance(vals, list) and vals:
+                        details[str(key)] = ", ".join(str(v) for v in vals)
+                    elif isinstance(vals, str) and vals:
+                        details[str(key)] = vals
+
+        extra_prop = goods.get("extraProperty") or {}
+        if isinstance(extra_prop, dict):
+            prop_list = extra_prop.get("propertyList") or []
+            for item in prop_list:
                 if isinstance(item, dict):
-                    key = item.get("name") or item.get("key") or item.get("attrName") or item.get("label", "")
-                    val = item.get("value") or item.get("attrValue") or item.get("val") or item.get("content", "")
-                    if key and val:
-                        details[str(key)] = str(val)
-        if details:
-            return details
-        # HTML 表格/列表
-        for row in self.soup.select(
-            '[class*="specification"] tr, [class*="spec"] tr, '
-            '[class*="attribute"] tr, [class*="detail"] tr'
-        ):
-            cells = row.select("td, th")
-            if len(cells) >= 2:
-                key = safe_text(cells[0]).rstrip(":")
-                val = safe_text(cells[1])
-                if key and val:
-                    details[key] = val
-        for item in self.soup.select(
-            '[class*="specification"] li, [class*="attribute"] li, '
-            '[class*="spec"] li, [class*="property"] li'
-        ):
-            text = safe_text(item)
-            if ":" in text:
-                parts = text.split(":", 1)
-                key, val = parts[0].strip(), parts[1].strip()
-                if key and val:
-                    details[key] = val
+                    rich = item.get("richText") or {}
+                    texts = rich.get("textRich") or []
+                    label_parts, value_parts = [], []
+                    for t in texts:
+                        if isinstance(t, dict):
+                            ttype = t.get("type", -1)
+                            val = t.get("value", "")
+                            if ttype == 0 and val:
+                                label_parts.append(val)
+                            elif val and ttype != 0:
+                                value_parts.append(val)
+                    if label_parts and value_parts:
+                        details[" ".join(label_parts)] = " ".join(value_parts)
+
+        sale_info = goods.get("saleInfo") or {}
+        if isinstance(sale_info, dict):
+            for sk in ["goodsSoldTip", "sideSalesTip"]:
+                v = sale_info.get(sk, "")
+                if v and v.strip():
+                    details["Sales"] = str(v).strip().rstrip(",")
+
+        mall_data = store.get("mall", {})
+        if isinstance(mall_data, dict):
+            mall_detail = mall_data.get("mallData", mall_data)
+            for mk, ml in [("mallName", "Store Name"), ("mallStarStr", "Store Rating"),
+                           ("reviewNumStr", "Store Reviews"), ("goodsNum", "Store Products"),
+                           ("followerNumUnit", "Store Followers")]:
+                v = mall_detail.get(mk)
+                if v:
+                    if isinstance(v, list):
+                        v = " ".join(str(x) for x in v)
+                    if str(v).strip():
+                        details[ml] = str(v)
+
+        for f in ["soldQuantity", "soldCount"]:
+            v = goods.get(f)
+            if v and str(v).strip():
+                details["Sold Quantity"] = str(v)
+
+        local_info = store.get("localInfo") or {}
+        if isinstance(local_info, dict):
+            for k in ["region", "language", "currency"]:
+                v = local_info.get(k, "")
+                if v:
+                    details[k] = str(v)
+
         return details
 
     # ---------- SKU / 变体解析 ----------
@@ -1033,51 +1143,31 @@ class TemuProductParser:
     # ---------- 主解析入口 ----------
 
     def parse(self):
-        pdata = self._get_product_data()
-        store = deep_get(self._extract_page_data(), "raw_data", "store") or {}
-
-        # 如果内嵌数据为空，尝试从 URL 和 rawData store 中提取
-        title = self.parse_title()
-        if not title:
-            title = self._parse_title_from_url()
-
-        price_val, currency = self.parse_price()
-        if price_val == "0.00":
-            price_val, currency = self._parse_price_from_store(store)
-
-        categories = self.parse_categories()
-        images = self.parse_images()
-        if not images:
-            images = self._parse_images_from_url()
-        brand = self.parse_brand()
-        if not brand:
-            brand = self._parse_brand_from_store(store)
-        about = self.parse_about_this_item()
-        details = self.parse_product_details()
-        if not details:
-            details = self._parse_details_from_store(store)
-        desc = self.parse_product_description()
-
-        # 检查 API 错误
+        store = self._get_store()
+        goods = store.get("goods", {})
         error = store.get("error") or store.get("webLayoutError") or {}
+
         if error:
             logger.warning(f"页面数据加载异常: {json.dumps(error, ensure_ascii=False)}")
 
+        mall_id = goods.get("mallId") or store.get("mallId") or ""
+
         return {
             "goodsId": self.goods_id,
-            "categories": categories,
-            "images": images,
-            "title": title,
-            "price": price_val,
-            "currency": currency,
-            "brand": brand,
-            "aboutThisItem": about,
-            "productDetails": details,
-            "productDescription": desc,
+            "categories": self.parse_categories(),
+            "images": self.parse_images(),
+            "title": self.parse_title(),
+            "price": self.parse_price()[0],
+            "currency": self.parse_price()[1],
+            "brand": self.parse_brand(),
+            "aboutThisItem": self.parse_about_this_item(),
+            "productDetails": self.parse_product_details(),
+            "productDescription": self.parse_product_description(),
             "source_url": self.source_url,
-            "mallId": store.get("mallId", ""),
+            "mallId": mall_id,
             "platform_code": "temu",
             "skus": self.parse_skus(),
+            "_api_error": error if error else None,
         }
 
     # ---------- URL/Fallback 数据提取 ----------
@@ -1109,61 +1199,6 @@ class TemuProductParser:
                     logger.info(f"从 URL 提取图片: {url_val}")
                     return images
         return images
-
-    def _parse_price_from_store(self, store):
-        """从 rawData store 中提取价格信息"""
-        local_info = store.get("localInfo") or store.get("webLayoutData", {}).get("commonData", {}).get("localInfo") or {}
-        currency_code = local_info.get("currency", "USD")
-        currency_map = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "KRW": "₩", "CAD": "$"}
-        currency = currency_map.get(currency_code, "$")
-
-        # 尝试从 store 中找到价格
-        price_data = store.get("price") or store.get("salePrice") or store.get("minPrice")
-        if price_data is None:
-            return "0.00", currency
-        if isinstance(price_data, dict):
-            amount = price_data.get("amount") or price_data.get("value") or 0
-            try:
-                price_float = float(amount) / 100
-            except (ValueError, TypeError):
-                price_float = safe_float(str(amount))
-            return f"{price_float:.2f}", currency
-        elif isinstance(price_data, (int, float)):
-            try:
-                price_float = float(price_data) / 100
-            except (ValueError, TypeError):
-                price_float = safe_float(str(price_data))
-            return f"{price_float:.2f}", currency
-        return "0.00", currency
-
-    def _parse_brand_from_store(self, store):
-        """从 rawData store 中提取品牌"""
-        mall_data = store.get("mall") or {}
-        if isinstance(mall_data, dict):
-            for k in ["mallName", "mall_name", "name", "shopName"]:
-                v = mall_data.get(k, "")
-                if v:
-                    return str(v)
-        return ""
-
-    def _parse_details_from_store(self, store):
-        """从 rawData store 中提取商品详情"""
-        details = {}
-        # 从 formatSkuData 中提取规格信息
-        sku_data = store.get("formatSkuData") or {}
-        if isinstance(sku_data, dict):
-            for k, v in sku_data.items():
-                if v and k not in ("skuTypeValues", "skuInfos", "skuInfoMap"):
-                    if isinstance(v, dict) and len(v) > 0:
-                        details[f"sku_{k}"] = str(len(v))
-        # 本地信息
-        local_info = store.get("localInfo") or {}
-        if isinstance(local_info, dict):
-            for k in ["region", "language", "currency"]:
-                v = local_info.get(k, "")
-                if v:
-                    details[k] = str(v)
-        return details
 
 
 # ========================= 主流程 =========================

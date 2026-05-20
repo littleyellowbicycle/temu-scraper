@@ -511,7 +511,10 @@ class CloakTemuParser:
                                 raw = re.sub(r'\bundefined\b', 'null', raw)
                                 data = json.loads(raw)
                                 self._store = data.get("store", {})
-                                logger.info(f"提取 rawData.store: {len(self._store)} keys")
+                                goods = self._store.get("goods", {})
+                                logger.info(f"提取 rawData.store: {len(self._store)} keys, goods: {len(goods)} keys")
+                                if goods:
+                                    logger.info(f"goods 字段: {list(goods.keys())[:30]}")
                                 return self._store
                             except json.JSONDecodeError as e:
                                 logger.warning(f"rawData 解析失败: {e}")
@@ -578,29 +581,29 @@ class CloakTemuParser:
                 amount = val.get("amount") or val.get("value") or val.get("cent")
                 currency_code = val.get("currencyCode") or val.get("currency", "")
 
-                # 日本站点: 尝试从 store 获取货币
                 if not currency_code:
                     local_info = store.get("localInfo") or {}
-                    currency_code = local_info.get("currency", "JPY")
+                    currency_code = local_info.get("currency", "USD")
 
                 if amount is not None:
                     try:
-                        price_float = float(amount) / 100
+                        amount_f = float(amount)
+                        if currency_code in ("JPY", "KRW"):
+                            price_float = amount_f
+                        else:
+                            price_float = amount_f / 100
                     except (ValueError, TypeError):
                         price_float = safe_float(str(amount))
                     currency_map = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "KRW": "₩", "CAD": "$"}
-                    return f"{price_float:.2f}", currency_map.get(currency_code, "$")
+                    return f"{price_float:.0f}" if currency_code in ("JPY", "KRW") else f"{price_float:.2f}", currency_map.get(currency_code, "$")
             elif isinstance(val, (int, float)):
-                # 判断是否为分单位: 如果是日本站点或金额较大，按分处理
+                # JP site: prices are in yen (no cent division needed)
                 local_info = store.get("localInfo") or {}
-                currency = local_info.get("currency", "")
-                if val > 100 or currency in ("JPY", "KRW"):
-                    try:
-                        return f"{float(val) / 100:.2f}", {"JPY": "¥", "KRW": "₩"}.get(currency, "$")
-                    except (ValueError, TypeError):
-                        pass
+                currency_code = local_info.get("currency", "")
+                if currency_code in ("JPY", "KRW"):
+                    return f"{float(val):.0f}", {"JPY": "¥", "KRW": "₩"}.get(currency_code, "$")
                 try:
-                    return f"{float(val):.2f}", "$"
+                    return f"{float(val) / 100:.2f}", "$"
                 except (ValueError, TypeError):
                     return f"{safe_float(str(val)):.2f}", "$"
             elif isinstance(val, str):
@@ -645,50 +648,66 @@ class CloakTemuParser:
     def parse_brand(self):
         store = self._get_store()
         goods = store.get("goods", {})
-        mall_data = store.get("mall", {})
 
+        # 优先从 mall 信息获取
+        mall_data = store.get("mall", {})
+        if isinstance(mall_data, dict):
+            mall_detail = mall_data.get("mallData", mall_data)
+            for key in ["mallName", "name"]:
+                v = mall_detail.get(key, "")
+                if v:
+                    return str(v)
+
+        # 从 saleInfo 获取
+        sale_info = goods.get("saleInfo") or {}
+        for key in ["mallName", "providedBy"]:
+            v = sale_info.get(key, "")
+            if v:
+                return str(v)
+
+        # 从 goods 直接字段
         for key in ["brand", "brandName", "brand_name"]:
             val = goods.get(key, "")
-            if val:
-                return str(val)
-        for key in ["mallName", "shopName", "name"]:
-            val = mall_data.get(key, "")
             if val:
                 return str(val)
 
         brand_el = self.soup.select_one('[class*="brand"], [class*="store"], [class*="mall"]')
         if brand_el:
-            text = safe_text(brand_el)
-            if text:
-                return text
+            return safe_text(brand_el)
         return ""
 
     def parse_categories(self):
         store = self._get_store()
         goods = store.get("goods", {})
-        cat_data = goods.get("category") or goods.get("categories") or goods.get("catPath", [])
 
-        categories = []
-        if isinstance(cat_data, list):
-            for item in cat_data:
-                if isinstance(item, dict):
-                    name = item.get("name") or item.get("catName") or item.get("categoryName", "")
-                    if name and name not in categories:
-                        categories.append(str(name))
-                elif isinstance(item, str) and item not in categories:
-                    categories.append(item)
-        elif isinstance(cat_data, str) and cat_data:
-            categories = [c.strip() for c in cat_data.split("/") if c.strip()]
-
-        if categories:
-            return categories
+        # 从 goods catId 字段构建分类路径（Temu 日本站没有 category 数组）
+        cat_ids = {}
+        for k in ["catId", "catId1", "catId2", "catId3", "catId4"]:
+            v = goods.get(k)
+            if v and isinstance(v, int):
+                cat_ids[k] = v
 
         # 面包屑
+        categories = []
         for a in self.soup.select('[class*="breadcrumb"] a, nav a'):
             text = safe_text(a)
             if text and text.lower() not in ("home", "temu", ""):
                 if text not in categories:
                     categories.append(text)
+
+        if categories:
+            return categories
+
+        # 回退 store 中的 category 数据
+        cat_data = goods.get("category") or goods.get("categories") or []
+        if isinstance(cat_data, list):
+            for item in cat_data:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("catName", "")
+                    if name and name not in categories:
+                        categories.append(str(name))
+                elif isinstance(item, str) and item not in categories:
+                    categories.append(item)
         return categories
 
     def parse_images(self):
@@ -724,39 +743,129 @@ class CloakTemuParser:
     def parse_about_this_item(self):
         store = self._get_store()
         goods = store.get("goods", {})
-        desc_list = goods.get("description") or goods.get("highlights") or goods.get("features") or []
-        bullets = []
-        if isinstance(desc_list, list):
-            for item in desc_list:
-                if isinstance(item, dict):
-                    text = item.get("text") or item.get("content") or item.get("desc", "")
-                    if text:
-                        bullets.append(str(text))
-                elif isinstance(item, str) and item:
-                    bullets.append(item)
-        elif isinstance(desc_list, str) and desc_list:
-            bullets.append(desc_list)
 
-        if not bullets:
-            for li in self.soup.select('[class*="description"] li, [class*="feature"] li, [class*="detail"] li'):
-                text = safe_text(li)
-                if text and len(text) > 5:
-                    bullets.append(text)
+        bullets = []
+
+        # 从 goodsProperty 提取描述
+        goods_prop = goods.get("goodsProperty") or []
+        if isinstance(goods_prop, list):
+            for prop in goods_prop:
+                if isinstance(prop, dict):
+                    key = prop.get("key", "")
+                    vals = prop.get("values") or []
+                    if isinstance(vals, list) and vals:
+                        bullets.append(f"{key}: {', '.join(str(v) for v in vals)}")
+
+        # 从 saleInfo 提取销售信息
+        sale_info = goods.get("saleInfo") or {}
+        if isinstance(sale_info, dict):
+            for sk in ["goodsSoldTip", "sideSalesTip"]:
+                v = sale_info.get(sk, "")
+                if v and v.strip():
+                    bullets.append(str(v).strip().rstrip(","))
+
+        # 从 extraProperty propertyList 提取富文本
+        extra_prop = goods.get("extraProperty") or {}
+        if isinstance(extra_prop, dict):
+            prop_list = extra_prop.get("propertyList") or []
+            for item in prop_list:
+                if isinstance(item, dict):
+                    rich = item.get("richText") or {}
+                    texts = rich.get("textRich") or []
+                    for t in texts:
+                        if isinstance(t, dict) and t.get("type") == 0:
+                            v = t.get("value", "")
+                            if v and v not in bullets:
+                                bullets.append(str(v))
+
+        # 标准描述字段
+        for src_name in ["description", "highlights", "features", "goodsDesc", "productDesc", "desc", "content"]:
+            val = goods.get(src_name) or store.get(src_name)
+            if val and isinstance(val, str) and val.strip() and val.strip() not in bullets:
+                bullets.append(val.strip())
+
+        # rows 中描述
+        rows = goods.get("rows") or store.get("rows") or []
+        if isinstance(rows, list):
+            for row in rows:
+                if isinstance(row, dict):
+                    desc = row.get("desc") or row.get("description") or row.get("text") or ""
+                    if desc and desc not in bullets:
+                        bullets.append(str(desc))
+
+        if bullets:
+            return bullets
+
+        # DOM 回退
+        for li in self.soup.select('[class*="description"] li, [class*="feature"] li, [class*="detail"] li'):
+            text = safe_text(li)
+            if text and len(text) > 5:
+                bullets.append(text)
         return bullets
 
     def parse_product_details(self):
         store = self._get_store()
         goods = store.get("goods", {})
+
         details = {}
 
-        spec_list = goods.get("specs") or goods.get("specifications") or goods.get("attrList") or []
-        if isinstance(spec_list, list):
-            for item in spec_list:
+        # goodsProperty 格式: {"key": "材質", "values": ["プラスチック"]}
+        goods_prop = goods.get("goodsProperty") or []
+        if isinstance(goods_prop, list):
+            for prop in goods_prop:
+                if isinstance(prop, dict):
+                    key = prop.get("key", "")
+                    vals = prop.get("values") or prop.get("value") or []
+                    if isinstance(vals, list) and vals:
+                        details[str(key)] = ", ".join(str(v) for v in vals)
+                    elif isinstance(vals, str) and vals:
+                        details[str(key)] = vals
+
+        # extraProperty.propertyList 中的 richText
+        extra_prop = goods.get("extraProperty") or {}
+        if isinstance(extra_prop, dict):
+            prop_list = extra_prop.get("propertyList") or []
+            for item in prop_list:
                 if isinstance(item, dict):
-                    key = item.get("name") or item.get("key") or item.get("attrName") or item.get("label", "")
-                    val = item.get("value") or item.get("val") or item.get("attrValue") or item.get("content", "")
-                    if key and val:
-                        details[str(key)] = str(val)
+                    rich = item.get("richText") or {}
+                    texts = rich.get("textRich") or []
+                    label_parts, value_parts = [], []
+                    for t in texts:
+                        if isinstance(t, dict):
+                            ttype = t.get("type", -1)
+                            val = t.get("value", "")
+                            if ttype == 0 and val:
+                                label_parts.append(val)
+                            elif val and ttype != 0:
+                                value_parts.append(val)
+
+        # saleInfo
+        sale_info = goods.get("saleInfo") or {}
+        if isinstance(sale_info, dict):
+            for sk in ["goodsSoldTip", "sideSalesTip"]:
+                v = sale_info.get(sk, "")
+                if v and v.strip():
+                    details["Sales"] = str(v).strip().rstrip(",")
+
+        # mall 详细信息
+        mall_data = store.get("mall", {})
+        if isinstance(mall_data, dict):
+            mall_detail = mall_data.get("mallData", mall_data)
+            for mk, ml in [("mallName", "Store Name"), ("mallStarStr", "Store Rating"),
+                           ("reviewNumStr", "Store Reviews"), ("goodsNum", "Store Products"),
+                           ("followerNumUnit", "Store Followers")]:
+                v = mall_detail.get(mk)
+                if v:
+                    if isinstance(v, list):
+                        v = " ".join(str(x) for x in v)
+                    if str(v).strip():
+                        details[ml] = str(v)
+
+        # 售出数量
+        for f in ["soldQuantity", "soldCount"]:
+            v = goods.get(f)
+            if v and str(v).strip():
+                details["Sold Quantity"] = str(v)
 
         # 本地信息
         local_info = store.get("localInfo") or {}
@@ -764,30 +873,52 @@ class CloakTemuParser:
             for k in ["region", "language", "currency"]:
                 v = local_info.get(k, "")
                 if v:
-                    details[f"local_{k}"] = str(v)
+                    details[k] = str(v)
 
         return details
+
+    def parse_product_description(self):
+        store = self._get_store()
+        goods = store.get("goods", {})
+        for key in ["productDescription", "desc", "description", "content", "goodsDesc"]:
+            val = goods.get(key, "")
+            if val and isinstance(val, str) and len(val) > 10:
+                return val
+        desc_el = self.soup.select_one('[class*="productDesc"], [class*="goodsDesc"], [class*="detailContent"]')
+        if desc_el:
+            return safe_text(desc_el)
+        return ""
 
     def parse_skus(self):
         store = self._get_store()
         goods = store.get("goods", {})
+        sku_data = store.get("formatSkuData") or {}
 
         skus = []
         price_val, currency = self.parse_price()
 
+        # 多个来源的 SKU 数据
         sku_list = (
             goods.get("skus") or goods.get("skuList") or
-            goods.get("variants") or goods.get("variantList") or []
+            goods.get("variants") or goods.get("variantList") or
+            sku_data.get("skuInfos") or []
         )
+        # skuInfos 可能是 dict (key→value) 或 list
+        if isinstance(sku_data.get("skuInfos"), dict):
+            sku_info_dict = sku_data.get("skuInfos", {})
+            if not sku_list and sku_info_dict:
+                sku_list = list(sku_info_dict.values())
 
         if isinstance(sku_list, list) and len(sku_list) > 0:
             for idx, item in enumerate(sku_list):
                 if not isinstance(item, dict):
                     continue
-                sku_id = str(item.get("skuId") or item.get("id") or f"{self.goods_id}_{idx}")
+                sku_id = str(item.get("skuId") or item.get("id") or item.get("sku_id") or f"{self.goods_id}_{idx}")
                 sku_name = str(item.get("skuName") or item.get("name") or item.get("title") or self.parse_title())
 
-                sku_price = safe_float(price_val) if price_val != "0.00" else None
+                # 价格
+                sku_price = None
+                price_kwargs = {}
                 price_field = item.get("price") or item.get("salePrice") or item.get("sale_price")
                 if isinstance(price_field, dict):
                     amount = price_field.get("amount") or price_field.get("value") or 0
@@ -795,23 +926,24 @@ class CloakTemuParser:
                         sku_price = float(amount) / 100
                     except (ValueError, TypeError):
                         sku_price = safe_float(str(amount))
+                    cc = price_field.get("currencyCode") or price_field.get("currency", "")
+                    price_kwargs["currency"] = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "CAD": "$"}.get(cc, currency)
                 elif isinstance(price_field, (int, float)):
                     try:
                         sku_price = float(price_field) / 100
                     except (ValueError, TypeError):
                         sku_price = safe_float(str(price_field))
-                elif isinstance(price_field, str):
-                    sku_price = safe_float(clean_price(price_field))
                 if sku_price is None:
-                    sku_price = safe_float(price_val)
+                    sku_price = safe_float(price_val) if price_val != "0.00" else 0.0
 
+                # 规格
                 spec_parts, spec_val_parts = [], []
-                spec_list = (
+                spec_sources = (
                     item.get("specList") or item.get("specs") or
                     item.get("attributes") or item.get("specValues") or []
                 )
-                if isinstance(spec_list, list):
-                    for spec in spec_list:
+                if isinstance(spec_sources, list):
+                    for spec in spec_sources:
                         if isinstance(spec, dict):
                             sn = spec.get("name") or spec.get("key") or spec.get("specName", "")
                             sv = spec.get("value") or spec.get("val") or spec.get("specValue", "")
@@ -821,36 +953,48 @@ class CloakTemuParser:
                         elif isinstance(spec, str):
                             spec_val_parts.append(spec)
 
+                # 缩略图
                 thumb = ""
-                thumb_data = item.get("thumb") or item.get("thumbUrl") or item.get("imageUrl")
+                thumb_data = item.get("thumb") or item.get("thumbUrl") or item.get("imageUrl") or item.get("thumb_image")
                 if isinstance(thumb_data, dict):
-                    thumb = thumb_data.get("url") or ""
+                    thumb = thumb_data.get("url") or thumb_data.get("src") or ""
                 elif isinstance(thumb_data, str):
                     thumb = thumb_data
+                if not thumb and self.parse_images():
+                    thumb = self.parse_images()[0]
 
+                # SKU 画廊
                 gallery = []
-                gallery_data = item.get("gallery") or item.get("images") or item.get("imgList") or []
+                gallery_data = (
+                    item.get("gallery") or item.get("images") or
+                    item.get("imgList") or item.get("imageList") or []
+                )
                 if isinstance(gallery_data, list):
                     for gid, g_item in enumerate(gallery_data, 1):
                         if isinstance(g_item, dict):
-                            g_url = g_item.get("url") or g_item.get("src", "")
+                            g_url = g_item.get("url") or g_item.get("src") or g_item.get("imageUrl", "")
                             if g_url:
                                 gallery.append({"id": gid, "url": str(g_url)})
                         elif isinstance(g_item, str):
                             gallery.append({"id": gid, "url": g_item})
+                if not gallery:
+                    gallery = self._parse_current_sku_gallery()
+
+                # SKU 链接
+                sku_url = item.get("url") or self.source_url
 
                 skus.append({
                     "skuId": sku_id,
                     "goodsId": self.goods_id,
                     "goodsName": sku_name,
                     "thumbUrl": str(thumb),
-                    "currency": currency,
+                    "currency": price_kwargs.get("currency", currency),
                     "price": sku_price,
                     "specKeyValues": ",".join(spec_parts),
                     "specValues": ",".join(spec_val_parts),
                     "skuGallery": gallery,
-                    "isskuGallery": 1,
-                    "url": self.source_url,
+                    "isskuGallery": 1 if gallery else 0,
+                    "url": sku_url,
                 })
 
         if not skus:
@@ -865,11 +1009,27 @@ class CloakTemuParser:
                 "specKeyValues": "",
                 "specValues": "",
                 "skuGallery": [],
-                "isskuGallery": 1,
+                "isskuGallery": 0,
                 "url": self.source_url,
             })
 
         return skus
+
+    def _parse_current_sku_gallery(self):
+        """从当前页面 DOM 提取 SKU 图片画廊"""
+        gallery, img_id, seen = [], 1, set()
+        for img in self.soup.select(
+            '[class*="gallery"] img, [class*="swiper"] img, '
+            '[class*="carousel"] img, [class*="slider"] img, '
+            '[class*="mainImage"] img, [class*="productImg"] img, '
+            'picture img'
+        ):
+            src = img.get("data-src") or img.get("src", "")
+            if src and not src.startswith("data:") and "icon" not in src and "logo" not in src and "sprite" not in src and src not in seen:
+                gallery.append({"id": img_id, "url": src})
+                img_id += 1
+                seen.add(src)
+        return gallery
 
     # ---------- URL 回退方法 ----------
 
@@ -896,27 +1056,35 @@ class CloakTemuParser:
     # ---------- 主解析入口 ----------
 
     def parse(self):
-        price_val, currency = self.parse_price()
-        title = self.parse_title()
-        images = self.parse_images()
-        details = self.parse_product_details()
-
         store = self._get_store()
+        goods = store.get("goods", {})
         error = store.get("error") or store.get("webLayoutError") or {}
+
+        # 调试：保存 goods 原始数据供分析
+        try:
+            debug_path = f"{self.goods_id}_debug_store.json"
+            with open(debug_path, "w", encoding="utf-8") as f:
+                json.dump({"goods": goods, "mall": store.get("mall", {}),
+                            "displayModuleList": store.get("displayModuleStore", {}).get("displayModuleList", [])[:5]},
+                           f, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            pass
+
+        mall_id = goods.get("mallId") or store.get("mallId") or ""
 
         return {
             "goodsId": self.goods_id,
             "categories": self.parse_categories(),
-            "images": images,
-            "title": title,
-            "price": price_val,
-            "currency": currency,
+            "images": self.parse_images(),
+            "title": self.parse_title(),
+            "price": self.parse_price()[0],
+            "currency": self.parse_price()[1],
             "brand": self.parse_brand(),
             "aboutThisItem": self.parse_about_this_item(),
-            "productDetails": details,
-            "productDescription": "",
+            "productDetails": self.parse_product_details(),
+            "productDescription": self.parse_product_description(),
             "source_url": self.source_url,
-            "mallId": store.get("mallId", ""),
+            "mallId": mall_id,
             "platform_code": "temu",
             "skus": self.parse_skus(),
             "_api_error": error if error else None,
